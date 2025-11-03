@@ -55,6 +55,7 @@
 #include "src/core/ext/transport/chttp2/transport/transport_common.h"
 #include "src/core/lib/channel/channel_args.h"
 #include "src/core/lib/debug/trace.h"
+#include "src/core/lib/iomgr/closure.h"
 #include "src/core/lib/iomgr/exec_ctx.h"
 #include "src/core/lib/promise/activity.h"
 #include "src/core/lib/promise/context.h"
@@ -434,25 +435,34 @@ Http2Status Http2ClientTransport::ProcessHttp2SettingsFrame(
     on_receive_settings_ = nullptr;
   }
 
-  // TODO(tjagtap) : [PH2][P2] Decide later if we want this only for AckLastSend
-  // or does any other operation also need this lock.
-  MutexLock lock(&transport_mutex_);
   if (!frame.ack) {
     // Check if the received settings have legal values
     Http2Status status = ValidateSettingsValues(frame.settings);
     if (!status.IsOk()) {
       return status;
     }
-    // TODO(tjagtap) : [PH2][P1]
-    // Apply the new settings
-    // Quickly send the ACK to the peer once the settings are applied
+    http2::Http2ErrorCode error_code = http2::Http2ErrorCode::kNoError;
+    {
+      // TODO(tjagtap) : [PH2][P1] Decide later if we need this lock.
+      MutexLock lock(&transport_mutex_);
+      // TODO(tjagtap) [PH2][P2] Check if this is the best place to put this.
+      error_code = settings_.ApplyIncomingSettings(frame.settings);
+    }
+    if (error_code != http2::Http2ErrorCode::kNoError) {
+      return Http2Status::Http2ConnectionError(
+          error_code, "Received invalid settings from the peer.");
+    }
+    SpawnGuardedTransportParty("SettingsAck", TriggerWriteCycle());
   } else {
+    // TODO(tjagtap) : [PH2][P1] Decide later if we need this lock.
+    MutexLock lock(&transport_mutex_);
     // Process the SETTINGS ACK Frame
     if (settings_.AckLastSend()) {
-      // TODO(tjagtap) [PH2][P1][Settings] Fix this bug ASAP.
-      // Causing DCHECKS to fail because of incomplete plumbing.
-      // This is a bug.
-      // transport_settings_.OnSettingsAckReceived();
+      transport_settings_.OnSettingsAckReceived();
+      parser_.hpack_table()->SetMaxBytes(settings_.acked().header_table_size());
+      ActOnFlowControlAction(flow_control_.SetAckedInitialWindow(
+                                 settings_.acked().initial_window_size()),
+                             /*stream=*/nullptr);
     } else {
       // TODO(tjagtap) [PH2][P4] : The RFC does not say anything about what
       // should happen if we receive an unsolicited SETTINGS ACK. Decide if we
@@ -918,12 +928,13 @@ auto Http2ClientTransport::WriteControlFrames() {
   if (is_first_write_) {
     GRPC_HTTP2_CLIENT_DLOG << "Http2ClientTransport WriteControlFrames "
                               "GRPC_CHTTP2_CLIENT_CONNECT_STRING";
-    output_buf.Append(Slice(
-        grpc_slice_from_copied_string(GRPC_CHTTP2_CLIENT_CONNECT_STRING)));
+    output_buf.Append(
+        Slice::FromCopiedString(GRPC_CHTTP2_CLIENT_CONNECT_STRING));
     is_first_write_ = false;
     //  SETTINGS MUST be the first frame to be written onto a connection as per
     //  RFC9113.
-    MaybeGetSettingsFrame(output_buf);
+    should_spawn_settings_timeout_ = MaybeGetSettingsAndSettingsAckFrames(
+        flow_control_, settings_, output_buf).settings_frame_written;
   }
 
   // Order of Control Frames is important.
@@ -936,7 +947,9 @@ auto Http2ClientTransport::WriteControlFrames() {
 
   goaway_manager_.MaybeGetSerializedGoawayFrame(output_buf);
   if (!goaway_manager_.IsImmediateGoAway()) {
-    MaybeGetSettingsFrame(output_buf);
+    should_spawn_settings_timeout_ = MaybeGetSettingsAndSettingsAckFrames(
+                                         flow_control_, settings_, output_buf)
+                                         .settings_frame_written;
     ping_manager_.MaybeGetSerializedPingFrames(output_buf,
                                                NextAllowedPingInterval());
     MaybeGetWindowUpdateFrames(output_buf);
@@ -969,6 +982,8 @@ void Http2ClientTransport::NotifyControlFramesWriteDone() {
   }
   ping_manager_.NotifyPingSent(ping_timeout_);
   goaway_manager_.NotifyGoawaySent();
+  // Only spawn if settings was written
+  MaybeSpawnWaitForSettingsTimeout();
 }
 
 auto Http2ClientTransport::SerializeAndWrite(std::vector<Http2Frame>&& frames) {
@@ -1110,6 +1125,7 @@ auto Http2ClientTransport::MultiplexerLoop() {
                   << status;
               return status;
             }
+            self->EnforceLatestSettings();
             self->NotifyControlFramesWriteDone();
             return absl::OkStatus();
           });
@@ -1912,7 +1928,7 @@ void Http2ClientTransport::StartCall(CallHandler call_handler) {
                // For a gRPC Client, we only need to check the
                // MAX_CONCURRENT_STREAMS setting compliance at the time of
                // sending (that is write path). A gRPC Client will never
-               // receive a stream initiated by a server, so we dont have to
+               // receive a stream initiated by a server, so we don't have to
                // check MAX_CONCURRENT_STREAMS compliance on the Read-Path.
                //
                // TODO(tjagtap) : [PH2][P1] Check for MAX_CONCURRENT_STREAMS

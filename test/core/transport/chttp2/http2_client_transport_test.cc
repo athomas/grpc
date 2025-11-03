@@ -24,12 +24,15 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "src/core/call/call_spine.h"
 #include "src/core/call/message.h"
 #include "src/core/call/metadata.h"
+#include "src/core/call/metadata_batch.h"
 #include "src/core/config/core_configuration.h"
 #include "src/core/ext/transport/chttp2/transport/flow_control.h"
 #include "src/core/ext/transport/chttp2/transport/frame.h"
@@ -41,10 +44,17 @@
 #include "src/core/lib/channel/channel_args.h"
 #include "src/core/lib/event_engine/default_event_engine.h"
 #include "src/core/lib/iomgr/exec_ctx.h"
+#include "src/core/lib/promise/map.h"
 #include "src/core/lib/promise/poll.h"
 #include "src/core/lib/promise/seq.h"
+#include "src/core/lib/promise/sleep.h"
 #include "src/core/lib/promise/try_join.h"
+#include "src/core/lib/promise/try_seq.h"
 #include "src/core/lib/resource_quota/arena.h"
+#include "src/core/lib/slice/slice.h"
+#include "src/core/lib/slice/slice_buffer.h"
+#include "src/core/lib/slice/slice_internal.h"
+#include "src/core/util/crash.h"
 #include "src/core/util/notification.h"
 #include "src/core/util/orphanable.h"
 #include "src/core/util/time.h"
@@ -55,6 +65,7 @@
 #include "test/core/transport/util/transport_test.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/functional/any_invocable.h"
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/strings/string_view.h"
@@ -431,8 +442,6 @@ TEST_F(Http2ClientTransportTest, TestHttp2ClientTransportPingTimeout) {
   // the ReadLoop is blocked. The reason we need to do this is once the
   // ReadLoop is broken, it would trigger a CloseTransport and the pending
   // asserts would never be satisfied.
-  auto read_close = mock_endpoint.ExpectDelayedReadClose(
-      absl::UnavailableError(kConnectionClosed), event_engine().get());
   mock_endpoint.ExpectWrite(
       {
           EventEngineSlice(
@@ -440,6 +449,14 @@ TEST_F(Http2ClientTransportTest, TestHttp2ClientTransportPingTimeout) {
           helper_.EventEngineSliceFromHttp2SettingsFrameDefault(),
       },
       event_engine().get());
+  mock_endpoint.ExpectRead(
+      {helper_.EventEngineSliceFromHttp2SettingsFrameAck()},
+      event_engine().get());
+  mock_endpoint.ExpectRead(
+      {helper_.EventEngineSliceFromHttp2SettingsFrameAck()},
+      event_engine().get());
+  auto read_close = mock_endpoint.ExpectDelayedReadClose(
+      absl::UnavailableError(kConnectionClosed), event_engine().get());
   mock_endpoint.ExpectWriteWithCallback(
       {
           helper_.EventEngineSliceFromHttp2PingFrame(/*ack=*/false,
@@ -455,6 +472,8 @@ TEST_F(Http2ClientTransportTest, TestHttp2ClientTransportPingTimeout) {
       });
   mock_endpoint.ExpectWrite(
       {
+          helper_.EventEngineSliceFromHttp2SettingsFrame(
+              {{4, 4194304}, {5, 4194304}}),
           helper_.EventEngineSliceFromHttp2WindowUpdateFrame(0, 4128769),
       },
       event_engine().get());
@@ -758,6 +777,9 @@ TEST_F(Http2ClientTransportTest, StreamCleanupTrailingMetadata) {
           helper_.EventEngineSliceFromHttp2SettingsFrameDefault(),
       },
       event_engine().get());
+  mock_endpoint.ExpectRead(
+      {helper_.EventEngineSliceFromHttp2SettingsFrameAck()},
+      event_engine().get());
   mock_endpoint.ExpectWriteWithCallback(
       {
           helper_.EventEngineSliceFromHttp2HeaderFrame(
@@ -799,6 +821,8 @@ TEST_F(Http2ClientTransportTest, StreamCleanupTrailingMetadata) {
       });
   mock_endpoint.ExpectWrite(
       {
+          helper_.EventEngineSliceFromHttp2SettingsFrame(
+              {{4, 4194304}, {5, 4194304}}),
           helper_.EventEngineSliceFromHttp2WindowUpdateFrame(0, 4128769),
       },
       event_engine().get());
@@ -853,6 +877,9 @@ TEST_F(Http2ClientTransportTest, StreamCleanupTrailingMetadataWithResetStream) {
           helper_.EventEngineSliceFromHttp2SettingsFrameDefault(),
       },
       event_engine().get());
+  mock_endpoint.ExpectRead(
+      {helper_.EventEngineSliceFromHttp2SettingsFrameAck()},
+      event_engine().get());
   mock_endpoint.ExpectWriteWithCallback(
       {
           helper_.EventEngineSliceFromHttp2HeaderFrame(
@@ -886,6 +913,8 @@ TEST_F(Http2ClientTransportTest, StreamCleanupTrailingMetadataWithResetStream) {
       event_engine().get());
   mock_endpoint.ExpectWrite(
       {
+          helper_.EventEngineSliceFromHttp2SettingsFrame(
+              {{4, 4194304}, {5, 4194304}}),
           helper_.EventEngineSliceFromHttp2WindowUpdateFrame(0, 4128769),
       },
       event_engine().get());
@@ -939,6 +968,9 @@ TEST_F(Http2ClientTransportTest, StreamCleanupResetStream) {
           helper_.EventEngineSliceFromHttp2SettingsFrameDefault(),
       },
       event_engine().get());
+  mock_endpoint.ExpectRead(
+      {helper_.EventEngineSliceFromHttp2SettingsFrameAck()},
+      event_engine().get());
   mock_endpoint.ExpectWriteWithCallback(
       {
           helper_.EventEngineSliceFromHttp2HeaderFrame(
@@ -967,6 +999,8 @@ TEST_F(Http2ClientTransportTest, StreamCleanupResetStream) {
       event_engine().get());
   mock_endpoint.ExpectWrite(
       {
+          helper_.EventEngineSliceFromHttp2SettingsFrame(
+              {{4, 4194304}, {5, 4194304}}),
           helper_.EventEngineSliceFromHttp2WindowUpdateFrame(0, 4128769),
       },
       event_engine().get());
@@ -1339,6 +1373,9 @@ TEST_F(Http2ClientTransportTest, TestFlowControlWindow) {
   mock_endpoint.ExpectRead(
       {helper_.EventEngineSliceFromHttp2SettingsFrameDefault()},
       event_engine().get());
+  mock_endpoint.ExpectRead(
+      {helper_.EventEngineSliceFromHttp2SettingsFrameAck()},
+      event_engine().get());
 
   // Simulate the client receiving two WINDOW_UPDATE frames from the peer.
   mock_endpoint.ExpectRead(
@@ -1363,6 +1400,13 @@ TEST_F(Http2ClientTransportTest, TestFlowControlWindow) {
       });
   mock_endpoint.ExpectWrite(
       {
+          helper_.EventEngineSliceFromHttp2SettingsFrameAck(),
+      },
+      event_engine().get());
+  mock_endpoint.ExpectWrite(
+      {
+          helper_.EventEngineSliceFromHttp2SettingsFrame(
+              {{4, 4194304}, {5, 4194304}}),
           helper_.EventEngineSliceFromHttp2WindowUpdateFrame(0, 4128769),
       },
       event_engine().get());

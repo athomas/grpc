@@ -51,10 +51,13 @@
 #include "src/core/lib/iomgr/closure.h"
 #include "src/core/lib/iomgr/iomgr_fwd.h"
 #include "src/core/lib/promise/activity.h"
+#include "src/core/lib/promise/context.h"
 #include "src/core/lib/promise/if.h"
+#include "src/core/lib/promise/latch.h"
 #include "src/core/lib/promise/map.h"
 #include "src/core/lib/promise/party.h"
 #include "src/core/lib/promise/promise.h"
+#include "src/core/lib/promise/race.h"
 #include "src/core/lib/promise/try_seq.h"
 #include "src/core/lib/resource_quota/memory_quota.h"
 #include "src/core/lib/transport/connectivity_state.h"
@@ -67,6 +70,8 @@
 #include "src/core/util/ref_counted_ptr.h"
 #include "src/core/util/sync.h"
 #include "src/core/util/time.h"
+#include "absl/base/thread_annotations.h"
+#include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/functional/any_invocable.h"
 #include "absl/log/log.h"
@@ -412,26 +417,42 @@ class Http2ClientTransport final : public ClientTransport,
   void MarkPeerSettingsResolved() {
     settings_.SetPreviousSettingsPromiseResolved(true);
   }
+  void EnforceLatestSettings() {
+    encoder_.SetMaxTableSize(settings_.peer().header_table_size());
+  }
   auto WaitForSettingsTimeoutDone() {
-    return [self = RefAsSubclass<Http2ClientTransport>()](absl::Status status) {
-      if (!status.ok()) {
-        GRPC_UNUSED absl::Status result = self->HandleError(
-            std::nullopt, Http2Status::Http2ConnectionError(
-                              Http2ErrorCode::kProtocolError,
-                              std::string(RFC9113::kSettingsTimeout)));
-      } else {
+    // TODO(tjagtap) : [PH2][P1][Settings] : Handle Transport Close case.
+    // In case of transport close, we dont actually timeout. Nor can we
+    // MarkPeerSettingsResolved
+    return [self = RefAsSubclass<Http2ClientTransport>()](Http2Status status) {
+      GRPC_DCHECK(status.GetType() !=
+                  Http2Status::Http2ErrorType::kStreamError);
+      if (self->transport_settings_.ShouldCloseConnection(status)) {
+        GRPC_UNUSED absl::Status result =
+            self->HandleError(std::nullopt, std::move(status));
+      } else if (status.GetType() == Http2Status::Http2ErrorType::kOk) {
         self->MarkPeerSettingsResolved();
+      } else {
+        GRPC_DCHECK(false)
+            << "status: " << status.DebugString()
+            << ". Investigate this case and see if error handling is needed";
       }
     };
   }
+
   // TODO(tjagtap) : [PH2][P1] : Plumbing. Call this after the SETTINGS frame
   // has been written to endpoint_.
-  void SpawnWaitForSettingsTimeout() {
-    settings_.SetPreviousSettingsPromiseResolved(false);
-    general_party_->Spawn("WaitForSettingsTimeout",
-                          transport_settings_.WaitForSettingsTimeout(),
-                          WaitForSettingsTimeoutDone());
+  void MaybeSpawnWaitForSettingsTimeout() {
+    if (should_spawn_settings_timeout_) {
+      settings_.SetPreviousSettingsPromiseResolved(false);
+      general_party_->Spawn("WaitForSettingsTimeout",
+                            transport_settings_.WaitForSettingsTimeout(),
+                            WaitForSettingsTimeoutDone());
+      should_spawn_settings_timeout_ = false;
+    }
   }
+
+  // "third_party/grpc"
 
   auto EndpointRead(const size_t num_bytes) {
     return Map(endpoint_.Read(num_bytes),
@@ -544,13 +565,6 @@ class Http2ClientTransport final : public ClientTransport,
   }
   auto WaitForPingAck() { return ping_manager_.WaitForPingAck(); }
 
-  void MaybeGetSettingsFrame(SliceBuffer& output_buf) {
-    std::optional<Http2Frame> settings_frame = settings_.MaybeSendUpdate();
-    if (settings_frame.has_value()) {
-      Serialize(absl::Span<Http2Frame>(&settings_frame.value(), 1), output_buf);
-      flow_control_.FlushedSettings();
-    }
-  }
 
   void MaybeGetWindowUpdateFrames(SliceBuffer& output_buf);
 
@@ -750,6 +764,8 @@ class Http2ClientTransport final : public ClientTransport,
   // indicates extreme memory pressure on the server.
   bool should_stall_read_loop_;
   Waker read_loop_waker_;
+  bool should_spawn_settings_timeout_ = false;
+
   Http2Status PartiallyProcessHeaderContinuationFrame(
       SliceBuffer&& buffer, bool is_initial_metadata, bool is_end_headers,
       uint32_t stream_id, RefCountedPtr<Stream> stream,
