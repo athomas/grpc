@@ -289,6 +289,8 @@ class CollectionScope : public RefCounted<CollectionScope> {
     return labels_of_interest_.contains(label);
   }
 
+  bool IsRoot() const { return parents_.empty(); }
+
  private:
   friend class MetricsQuery;
   friend class instrument_detail::QueryableDomain;
